@@ -1,0 +1,306 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Screen Share — Host / Viewer</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="card">
+    <h1>Simple Screen Share</h1>
+
+    <div id="controls">
+      <input id="roomId" placeholder="Room ID (e.g. myroom123)" />
+      <input id="roomPass" placeholder="Room password" />
+      <div class="row">
+        <button id="createBtn">Create & Host</button>
+        <button id="joinBtn">Join as Viewer</button>
+      </div>
+    </div>
+
+    <div id="hostControls" class="hidden">
+      <p><strong>Hosting room:</strong> <span id="hostingRoom"></span></p>
+      <button id="startShare">Start Screen Share</button>
+      <button id="stopShare" disabled>Stop Sharing</button>
+      <p>Share link (give to viewer): <code id="shareLink"></code></p>
+      <h3>Local preview:</h3>
+      <video id="localPreview" autoplay playsinline muted></video>
+      <h3>Send files (to connected viewers):</h3>
+      <input type="file" id="fileInput" />
+      <button id="sendFileBtn">Send File</button>
+      <div id="hostLog" class="log"></div>
+    </div>
+
+    <div id="viewerControls" class="hidden">
+      <p><strong>Joined room:</strong> <span id="joinedRoom"></span></p>
+      <video id="remoteVideo" autoplay playsinline></video>
+      <div id="viewerLog" class="log"></div>
+    </div>
+
+    <div id="messages" class="log"></div>
+  </div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+/*
+ Single-page host/viewer logic:
+ - Use Socket.IO to create/join room
+ - Host captures screen, creates RTCPeerConnection, sends offer to room
+ - Viewer receives offer, creates answer
+ - Ice candidates forwarded by server
+ - DataChannel used by host -> viewer for file chunks
+*/
+const socket = io();
+
+const createBtn = document.getElementById('createBtn');
+const joinBtn = document.getElementById('joinBtn');
+const roomIdInput = document.getElementById('roomId');
+const roomPassInput = document.getElementById('roomPass');
+
+const hostControls = document.getElementById('hostControls');
+const viewerControls = document.getElementById('viewerControls');
+const hostingRoom = document.getElementById('hostingRoom');
+const joinedRoom = document.getElementById('joinedRoom');
+
+const startShare = document.getElementById('startShare');
+const stopShare = document.getElementById('stopShare');
+const localPreview = document.getElementById('localPreview');
+const remoteVideo = document.getElementById('remoteVideo');
+
+const fileInput = document.getElementById('fileInput');
+const sendFileBtn = document.getElementById('sendFileBtn');
+
+const shareLink = document.getElementById('shareLink');
+const messages = document.getElementById('messages');
+const hostLog = document.getElementById('hostLog');
+const viewerLog = document.getElementById('viewerLog');
+
+let pc = null;
+let localStream = null;
+let dataChannel = null;
+let isHost = false;
+let roomId = null;
+
+// STUN servers (public). Add TURN in production.
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+function log(el, ...args) {
+  const msg = args.join(' ');
+  el.innerText += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+createBtn.onclick = () => {
+  roomId = roomIdInput.value.trim() || Math.random().toString(36).slice(2,9);
+  const password = roomPassInput.value || '';
+  socket.emit('create-room', { roomId, password });
+};
+
+joinBtn.onclick = () => {
+  roomId = roomIdInput.value.trim();
+  const password = roomPassInput.value || '';
+  if (!roomId) return alert('Enter room ID');
+  socket.emit('join-room', { roomId, password });
+};
+
+socket.on('room-created', ({ roomId: r }) => {
+  isHost = true;
+  roomId = r;
+  hostingRoom.innerText = r;
+  hostControls.classList.remove('hidden');
+  shareLink.innerText = `${location.origin}?room=${r}`;
+  log(messages, 'Room created:', r);
+});
+
+socket.on('joined', ({ roomId: r, hostSocketId }) => {
+  isHost = false;
+  roomId = r;
+  joinedRoom.innerText = r;
+  viewerControls.classList.remove('hidden');
+  log(messages, 'Joined room:', r);
+});
+
+socket.on('join-failed', (msg) => alert('Join failed: ' + msg));
+socket.on('room-closed', () => alert('Room closed by host'));
+
+// HOST: start screen capture and create offer
+startShare.onclick = async () => {
+  try {
+    localStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch (e) {
+    return alert('Screen capture denied: ' + e.message);
+  }
+  localPreview.srcObject = localStream;
+  startShare.disabled = true;
+  stopShare.disabled = false;
+  await hostStartPeer();
+};
+
+stopShare.onclick = () => {
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localPreview.srcObject = null;
+  }
+  if (pc) pc.close();
+  pc = null;
+  startShare.disabled = false;
+  stopShare.disabled = true;
+  log(hostLog, 'Stopped sharing');
+};
+
+async function hostStartPeer() {
+  pc = new RTCPeerConnection(ICE);
+  // Add all tracks
+  localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+  // data channel for files
+  dataChannel = pc.createDataChannel('fileChannel');
+  dataChannel.binaryType = 'arraybuffer';
+  setupDataChannelHost();
+
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) socket.emit('ice-candidate', { roomId, candidate: ev.candidate });
+  };
+
+  // create offer and send to room
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  socket.emit('offer', { roomId, offer });
+  log(hostLog, 'Offer sent to room', roomId);
+}
+
+// VIEWER: receive offer, create answer
+socket.on('offer', async ({ offer, from }) => {
+  if (isHost) return; // host ignores its own offer
+  // create peer and set remote
+  pc = new RTCPeerConnection(ICE);
+  pc.ontrack = (ev) => {
+    remoteVideo.srcObject = ev.streams[0];
+    log(viewerLog, 'Received remote stream');
+  };
+  pc.ondatachannel = (ev) => {
+    dataChannel = ev.channel;
+    dataChannel.binaryType = 'arraybuffer';
+    setupDataChannelViewer();
+    log(viewerLog, 'DataChannel opened');
+  };
+  pc.onicecandidate = (ev) => {
+    if (ev.candidate) socket.emit('ice-candidate', { roomId, candidate: ev.candidate });
+  };
+
+  await pc.setRemoteDescription(offer);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  socket.emit('answer', { roomId, answer });
+  log(viewerLog, 'Answer sent to room');
+});
+
+socket.on('answer', async ({ answer }) => {
+  if (!isHost || !pc) return;
+  await pc.setRemoteDescription(answer);
+  log(hostLog, 'Answer received');
+});
+
+socket.on('ice-candidate', async ({ candidate }) => {
+  try {
+    if (!candidate) return;
+    if (!pc) {
+      console.warn('No peer connection yet; storing candidate');
+      return;
+    }
+    await pc.addIceCandidate(candidate);
+    if (isHost) log(hostLog, 'ICE candidate added');
+    else log(viewerLog, 'ICE candidate added');
+  } catch (e) {
+    console.error('Failed to add ICE', e);
+  }
+});
+
+/* Data channel file transfer (simple chunked sender/receiver) */
+const CHUNK_SIZE = 16 * 1024;
+
+function setupDataChannelHost() {
+  dataChannel.onopen = () => log(hostLog, 'DataChannel open');
+  dataChannel.onclose = () => log(hostLog, 'DataChannel closed');
+  dataChannel.onmessage = (e) => {
+    log(hostLog, 'Msg from viewer:', e.data);
+  };
+}
+
+let incomingBuffers = [];
+let incomingFilename = '';
+let incomingSize = 0;
+let receivedSize = 0;
+
+function setupDataChannelViewer() {
+  dataChannel.onmessage = (e) => {
+    // we expect JSON control messages or ArrayBuffer chunks
+    if (typeof e.data === 'string') {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'file-meta') {
+          incomingFilename = msg.name;
+          incomingSize = msg.size;
+          incomingBuffers = [];
+          receivedSize = 0;
+          log(viewerLog, `Incoming file ${incomingFilename} (${incomingSize} bytes)`);
+        }
+      } catch (err) {
+        log(viewerLog, 'Text msg:', e.data);
+      }
+      return;
+    }
+    // binary chunk
+    incomingBuffers.push(e.data);
+    receivedSize += e.data.byteLength;
+    log(viewerLog, `Received ${receivedSize}/${incomingSize}`);
+    if (receivedSize >= incomingSize) {
+      const blob = new Blob(incomingBuffers);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = incomingFilename || 'download';
+      a.textContent = `Download ${incomingFilename || 'file'}`;
+      viewerLog.appendChild(a);
+      viewerLog.appendChild(document.createElement('br'));
+      // reset
+      incomingBuffers = [];
+      incomingFilename = '';
+      incomingSize = 0;
+      receivedSize = 0;
+    }
+  };
+}
+
+/* Host: send file via dataChannel in chunks */
+sendFileBtn.onclick = async () => {
+  if (!isHost) return alert('Only host can send files');
+  if (!dataChannel || dataChannel.readyState !== 'open') return alert('Data channel not open');
+  const file = fileInput.files[0];
+  if (!file) return alert('Choose file');
+  // tell viewer about filename & size
+  dataChannel.send(JSON.stringify({ type: 'file-meta', name: file.name, size: file.size }));
+  const reader = new FileReader();
+  let offset = 0;
+  reader.onload = (e) => {
+    const buffer = e.target.result;
+    // chunk and send
+    while (offset < buffer.byteLength) {
+      const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+      dataChannel.send(chunk);
+      offset += CHUNK_SIZE;
+    }
+    log(hostLog, `Sent file ${file.name}`);
+  };
+  reader.readAsArrayBuffer(file);
+};
+
+/* UX: build share link from room query param */
+(function prefillRoomFromQuery(){
+  const params = new URLSearchParams(location.search);
+  const q = params.get('room');
+  if (q) roomIdInput.value = q;
+})();
+</script>
+</body>
+</html>
